@@ -1,10 +1,15 @@
 # ---------------------------------------------------------------------------
 # Secrets & local config  — NEVER commit real credentials.
-# .env.example files ARE committed (they hold no secrets); real .env files are not.
+# The *.example files ARE committed (they hold no secrets); real ones are not.
 # ---------------------------------------------------------------------------
+# Python builds: .env (auto-loaded by the scripts)
 .env
 .env.*
 !.env.example
+# PHP build: config.php (auto-loaded by swiftseek_connect)
+config.php
+**/config.php
+!config.example.php
 
 # ---------------------------------------------------------------------------
 # swiftseek-lite data store (the single-file JSON corpus + its atomic temp file)

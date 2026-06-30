@@ -1,0 +1,11 @@
+# swiftseek-mysql dependencies (Python 3.7+).
+
+# Required: the pure-Python MySQL driver.
+pymysql>=1.0
+
+# OPTIONAL — higher-fidelity PDF text extraction.
+# The built-in, pure-stdlib PDF extractor handles common text PDFs out of the box.
+# If pypdf is present it is used automatically for better results on trickier PDFs,
+# but it is NOT required. Uncomment to opt in:
+#
+# pypdf>=4
