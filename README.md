@@ -2,7 +2,7 @@
 
 **Give an AI agent a search tool, not a search engine.**
 
-AgentSwiftSeek is a tiny, fast search tool for your documents, built for AI agents. Instead of the usual "embed everything into a vector database" setup, it lets an agent search your documents the way a person would search a folder of files: look for a word, read around the matches, refine the search, repeat. It's deliberately small, cheap to run, and easy to understand.
+AgentSwiftSeek is a tiny, ultra fast search tool for your documents, built for AI agents. Instead of the usual "embed everything into a vector database" setup, it lets an agent search your documents the way a person would search a folder of files: look for a word, read around the matches, refine the search, repeat. It's deliberately small, cheap to run, and easy to understand.
 
 It comes in two flavors:
 
@@ -114,6 +114,10 @@ Early and intentionally small. The goal is to stay lean and easy to read — if 
 
 Contributions, ideas, and "this worked / didn't work for my documents" reports are all welcome.
 
-## License
+## Author
+Joey van Griethuijsen, freelance AI & Software Solutions Architect
+📧 Contact: [info@joeyvg.nl]
+🌐 Website: [https://joeyvg.nl/en]
 
-MIT — see `LICENSE`.
+## License
+MIT License
