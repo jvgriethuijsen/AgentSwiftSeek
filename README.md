@@ -115,7 +115,6 @@ Each script stays **one self-contained file**. Copy the folder you need; ignore 
 ```bash
 cd swiftseek-lite
 # nothing to install — Python's standard library only (Python 3.7+)
-cp .env.example .env                       # optional: sets SWIFTSEEK_STORE
 python swiftseek-lite.py init
 python swiftseek-lite.py ingest ./docs --doc-type policy   # a whole folder of pdf/docx/txt
 python swiftseek-lite.py search "flood"
