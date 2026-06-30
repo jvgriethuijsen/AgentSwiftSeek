@@ -25,15 +25,17 @@ Every command prints JSON to stdout. Exit codes (grep convention):
     1 = no matches (this is a SIGNAL, not a crash — refine and retry)
     2 = error (bad args, DB down, etc.)
 
+Search is CASE-INSENSITIVE by default; pass -s/--case-sensitive for exact case.
+
 The intended loop for answering a question about the documents:
 
   1. SEARCH with your best literal/regex guess:
          python swiftseek-mysql.py search "flood"
   2. If exit code == 1 (no matches), DO NOT give up. Expand the query the way a
      human would — you supply the semantics the lexical layer lacks:
-         python swiftseek-mysql.py search "flood|water damage|discharge|seepage" -i
+         python swiftseek-mysql.py search "flood|water damage|discharge|seepage"
   3. Narrow with metadata when you know it (this is your WHERE clause):
-         python swiftseek-mysql.py search "deductible" --doc-type policy --filepath "2024/"
+         python swiftseek-mysql.py search "deductible" --doc-type tag1 --filepath "2024/"
   4. When a match looks relevant, READ AROUND IT. Either bump context...
          python swiftseek-mysql.py search "burst pipe" -C 8
      ...or pull the whole document / a line range:
@@ -45,7 +47,7 @@ The intended loop for answering a question about the documents:
 
 OUTPUT IS CAPPED so a broad first search can't blow your context window:
   * --max-docs (default 20) and --max-matches (default 5 per doc) bound the COUNT.
-  * --max-line-chars (default 300) bounds the SIZE of each line. Extracted PDF/DOCX
+  * --max-line-chars (default 900) bounds the SIZE of each line. Extracted PDF/DOCX
     text often has paragraph- or whole-document-sized "lines", so each emitted line
     is snippeted around the match rather than dumped whole; shortened lines are
     flagged "truncated": true.
@@ -65,8 +67,8 @@ SETUP
     pip install -r requirements.txt          # just pymysql (pypdf is optional)
     cp .env.example .env  &&  edit .env       # credentials auto-load from .env
     python swiftseek-mysql.py migrate         # create the table once
-    python swiftseek-mysql.py add --file policy_001.pdf --doc-type policy
-    python swiftseek-mysql.py ingest ./docs --doc-type policy   # a whole folder
+    python swiftseek-mysql.py add --file policy_001.pdf --doc-type tag1
+    python swiftseek-mysql.py ingest ./docs --doc-type tag1   # a whole folder
     python swiftseek-mysql.py search "endorsement"
 
 Credentials come ONLY from the environment (SWIFTSEEK_HOST/PORT/USER/PASSWORD/DB) —
@@ -85,6 +87,17 @@ TEXT EXTRACTION (built in — few dependencies)
 PDF extraction is best effort: scanned/image-only PDFs and exotic font encodings can
 come back empty or garbled. `ingest` reports empty extraction as a failure rather
 than swallowing it — treat that as a signal, not success.
+
+METADATA (optional, filter-only — not validated, no built-in meaning)
+---------------------------------------------------------------------
+Each document carries doc_type, filepath and title (three plain columns). They exist
+only to narrow a search (the SQL WHERE clause):
+  * doc_type  a free-form tag YOU invent — any string at all, e.g. tag1, tag2, or a
+              real scheme like invoice / contract / nl. Filtered by EXACT match:
+              --doc-type tag1.
+  * filepath  source path, recorded automatically; filtered by SUBSTRING (--filepath).
+  * title     human label (defaults to the file's basename); shown, not filtered.
+Tag documents at add/ingest time, then scope searches to that tag. Omit to search all.
 
 COMMANDS
 --------
@@ -420,6 +433,7 @@ CREATE TABLE IF NOT EXISTS documents (
     doc_type    VARCHAR(64)   NULL,
     content     MEDIUMTEXT    NOT NULL,
     char_count  INT           NOT NULL DEFAULT 0,
+    mtime       DOUBLE        NULL,
     created_at  TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_doc_type (doc_type),
     KEY idx_filepath (filepath(255))
@@ -431,6 +445,14 @@ def cmd_migrate(_args):
     conn = connect()
     with conn.cursor() as cur:
         cur.execute(DDL)
+        # Add the mtime column to a pre-existing table (CREATE ... IF NOT EXISTS
+        # above won't touch one that already lacks it). Idempotent.
+        cur.execute("SELECT COUNT(*) AS c FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'documents' "
+                    "AND column_name = 'mtime'")
+        if cur.fetchone()["c"] == 0:
+            cur.execute("ALTER TABLE documents ADD COLUMN mtime DOUBLE NULL "
+                        "AFTER char_count")
     emit({"ok": True, "action": "migrate", "detail": "documents table ready"})
 
 
@@ -444,11 +466,13 @@ def cmd_add(args):
         except ExtractError as e:
             emit({"error": str(e)}, code=2)
         filepath = args.filepath or os.path.abspath(args.file)
+        mtime = _safe_mtime(args.file)
     elif args.content is not None:
         content = args.content
         if not args.filepath:
             emit({"error": "--filepath is required when using --content"}, code=2)
         filepath = args.filepath
+        mtime = None
     else:
         emit({"error": "provide either --file or --content"}, code=2)
 
@@ -456,9 +480,9 @@ def cmd_add(args):
     conn = connect()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO documents (filepath, title, doc_type, content, char_count) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (filepath, title, args.doc_type, content, len(content)),
+            "INSERT INTO documents (filepath, title, doc_type, content, char_count, "
+            "mtime) VALUES (%s, %s, %s, %s, %s, %s)",
+            (filepath, title, args.doc_type, content, len(content), mtime),
         )
         doc_id = cur.lastrowid
     emit({"ok": True, "action": "add", "id": doc_id,
@@ -485,18 +509,39 @@ def _iter_files(root, recursive, exts):
                 yield full
 
 
+def _safe_mtime(path):
+    """Source file modification time (epoch float), or None if it can't be read."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
 def cmd_ingest(args):
     if not os.path.exists(args.path):
         emit({"error": f"no such path: {args.path!r}"}, code=2)
     conn = connect()
-    added, skipped, failed = [], [], []
+    added, updated, skipped, failed = [], [], [], []
     with conn.cursor() as cur:
         for path in _iter_files(args.path, not args.no_recursive, SUPPORTED_EXTS):
             ap = os.path.abspath(path)
-            cur.execute("SELECT id FROM documents WHERE filepath = %s LIMIT 1", (ap,))
-            if cur.fetchone():
-                if not args.reindex:
-                    skipped.append(ap)
+            cur.execute("SELECT id, mtime, doc_type FROM documents "
+                        "WHERE filepath = %s LIMIT 1", (ap,))
+            existing = cur.fetchone()
+            replace = False
+            if existing:
+                if args.reindex:
+                    replace = True
+                elif args.update:
+                    cur_m = _safe_mtime(path)
+                    prev = existing.get("mtime")
+                    if cur_m is not None and (prev is None or cur_m > prev):
+                        replace = True
+                    else:
+                        skipped.append(ap)         # already stored and not newer
+                        continue
+                else:
+                    skipped.append(ap)             # already stored (default: skip)
                     continue
                 cur.execute("DELETE FROM documents WHERE filepath = %s", (ap,))
             try:
@@ -508,17 +553,24 @@ def cmd_ingest(args):
                 failed.append({"filepath": ap,
                                "error": "no_text_extracted (empty / image-only PDF?)"})
                 continue
+            # On replace, keep the previous doc_type unless a new one was given.
+            doc_type = args.doc_type
+            if doc_type is None and existing is not None:
+                doc_type = existing.get("doc_type")
             cur.execute(
-                "INSERT INTO documents (filepath, title, doc_type, content, char_count) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (ap, os.path.basename(ap), args.doc_type, content, len(content)),
+                "INSERT INTO documents (filepath, title, doc_type, content, char_count, "
+                "mtime) VALUES (%s, %s, %s, %s, %s, %s)",
+                (ap, os.path.basename(ap), doc_type, content, len(content),
+                 _safe_mtime(path)),
             )
-            added.append({"id": cur.lastrowid, "filepath": ap,
-                          "char_count": len(content)})
+            (updated if replace else added).append(
+                {"id": cur.lastrowid, "filepath": ap, "char_count": len(content)})
     emit({"ok": True, "action": "ingest",
-          "added": len(added), "skipped": len(skipped), "failed": len(failed),
-          "added_docs": added, "skipped_paths": skipped, "failed_docs": failed},
-         code=0 if (added or skipped) else 1)
+          "added": len(added), "updated": len(updated),
+          "skipped": len(skipped), "failed": len(failed),
+          "added_docs": added, "updated_docs": updated,
+          "skipped_paths": skipped, "failed_docs": failed},
+         code=0 if (added or updated or skipped) else 1)
 
 
 # ----------------------------------------------------------------------------- #
@@ -601,7 +653,8 @@ def cmd_search(args):
         sql += " WHERE " + " AND ".join(where)
 
     # Build the matcher. -F treats the pattern as a literal string.
-    flags = re.IGNORECASE if args.ignore_case else 0
+    ignore_case = not args.case_sensitive
+    flags = re.IGNORECASE if ignore_case else 0
     pat = re.escape(args.pattern) if args.fixed else args.pattern
     try:
         rx = re.compile(pat, flags)
@@ -658,7 +711,7 @@ def cmd_search(args):
 
     payload = {
         "pattern": args.pattern,
-        "ignore_case": args.ignore_case,
+        "ignore_case": ignore_case,
         "docs_searched": len(rows),
         "docs_matched": len(results),
         "total_matches": total_matches,
@@ -673,9 +726,9 @@ def cmd_search(args):
                            "larger --max-output-chars if you really need it all.")
     elif not results:
         payload["hint"] = ("No lexical match. Expand with synonyms / regex "
-                           "alternation (e.g. 'a|b|c'), add -i, or loosen metadata "
-                           "filters. If still empty, the question may be conceptual "
-                           "rather than lexical.")
+                           "alternation (e.g. 'a|b|c') or loosen metadata filters "
+                           "(matching is already case-insensitive). If still empty, "
+                           "the question may be conceptual rather than lexical.")
     emit(payload, code=0 if results else 1)
 
 
@@ -712,21 +765,29 @@ def build_parser():
     a.add_argument("--content", help="raw text content (alternative to --file)")
     a.add_argument("--filepath", help="original source path to record as metadata")
     a.add_argument("--title", help="document title (defaults to file basename)")
-    a.add_argument("--doc-type", dest="doc_type", help="e.g. policy, claim, manual")
+    a.add_argument("--doc-type", dest="doc_type",
+                   help="free-form tag you invent (any string, e.g. tag1); used only "
+                        "to filter searches later")
 
     ing = sub.add_parser("ingest",
                          help="recursively ingest a file or folder of documents")
     ing.add_argument("path", help="file or directory (.txt/.md/.docx/.pdf)")
     ing.add_argument("--doc-type", dest="doc_type",
-                     help="tag every ingested document with this type")
+                     help="free-form tag applied to every ingested document "
+                          "(any string, e.g. tag1)")
     ing.add_argument("--no-recursive", action="store_true",
                      help="do not descend into subdirectories")
+    ing.add_argument("--update", action="store_true",
+                     help="re-extract a stored file ONLY if the source is newer than "
+                          "the stored copy (otherwise skip); good for incremental "
+                          "re-ingests")
     ing.add_argument("--reindex", action="store_true",
-                     help="re-extract files already in the table (replace them) "
-                          "instead of skipping")
+                     help="re-extract every already-stored file (replace them all) "
+                          "regardless of age, instead of skipping")
 
     ls = sub.add_parser("list", help="list document metadata")
-    ls.add_argument("--doc-type", dest="doc_type")
+    ls.add_argument("--doc-type", dest="doc_type",
+                    help="exact-match filter on the doc_type tag (e.g. tag1)")
     ls.add_argument("--filepath", help="substring filter on filepath")
     ls.add_argument("--limit", type=int, default=100)
 
@@ -737,7 +798,10 @@ def build_parser():
 
     s = sub.add_parser("search", help="regex grep over content")
     s.add_argument("pattern", help="regex (or literal with -F)")
-    s.add_argument("-i", "--ignore-case", action="store_true", dest="ignore_case")
+    s.add_argument("-i", "--ignore-case", action="store_true", dest="ignore_case",
+                   help=argparse.SUPPRESS)  # back-compat; insensitive is the default
+    s.add_argument("-s", "--case-sensitive", action="store_true", dest="case_sensitive",
+                   help="case-sensitive matching (default: case-insensitive)")
     s.add_argument("-F", "--fixed", action="store_true",
                    help="treat pattern as a literal string, not regex")
     s.add_argument("-C", "--context", type=int, default=2,
@@ -746,9 +810,9 @@ def build_parser():
                    help="max matches reported per document (default 5)")
     s.add_argument("--max-docs", type=int, default=20,
                    help="max documents reported (default 20)")
-    s.add_argument("--max-line-chars", type=int, default=300, dest="max_line_chars",
+    s.add_argument("--max-line-chars", type=int, default=900, dest="max_line_chars",
                    help="cap per emitted line; long lines are snippeted around the "
-                        "match (default 300, 0 = unlimited). Guards against giant "
+                        "match (default 900, 0 = unlimited). Guards against giant "
                         "single-line PDF/DOCX paragraphs.")
     s.add_argument("--max-output-chars", type=int, default=40000,
                    dest="max_output_chars",
@@ -756,7 +820,8 @@ def build_parser():
                         "and sets truncated=true when exceeded (default 40000, "
                         "~10k tokens). Raise it if you deliberately want more.")
     # metadata filters = the SQL WHERE clause
-    s.add_argument("--doc-type", dest="doc_type")
+    s.add_argument("--doc-type", dest="doc_type",
+                   help="exact-match filter on the doc_type tag (e.g. tag1)")
     s.add_argument("--filepath", help="substring filter on filepath")
     s.add_argument("--id", dest="id_filter", type=int,
                    help="restrict to a single document id")

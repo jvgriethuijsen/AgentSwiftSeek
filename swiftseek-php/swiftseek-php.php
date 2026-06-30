@@ -19,7 +19,7 @@
  *     require_once __DIR__ . '/swiftseek-php.php';
  *     $db = swiftseek_connect();                       // auto-loads ./config.php
  *     swiftseek_migrate($db);                          // create the table once
- *     swiftseek_ingest($db, '/path/to/docs', ['doc_type' => 'policy']);
+ *     swiftseek_ingest($db, '/path/to/docs', ['doc_type' => 'tag1']);
  *     $hits = swiftseek_search($db, 'flood|water damage|discharge', ['ignore_case' => true]);
  *     header('Content-Type: application/json');
  *     echo json_encode($hits, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
@@ -59,6 +59,17 @@
  * PDF extraction is best effort: scanned/image-only PDFs (no text layer) and exotic
  * font encodings can come back empty or garbled. ingest() reports empty extraction as
  * a failure rather than swallowing it — treat that as a signal, not success.
+ *
+ * METADATA (optional, filter-only — not validated, no built-in meaning)
+ * ---------------------------------------------------------------------
+ * Each document carries doc_type, filepath and title. They exist only to narrow a
+ * search (the SQL WHERE clause):
+ *   * doc_type  a free-form tag YOU invent — any string at all, e.g. 'tag1', 'tag2',
+ *               or a real scheme like 'invoice' / 'contract'. EXACT-match filter:
+ *               ['doc_type' => 'tag1'].
+ *   * filepath  source path, recorded automatically; SUBSTRING filter ['filepath'=>..].
+ *   * title     human label (defaults to the file's basename); shown, not filtered.
+ * Tag at add/ingest time, then scope searches to that tag. Omit it to search all.
  *
  * REQUIREMENTS (this is PHP's "requirements.txt" — server config, not a pip file)
  * --------------------------------------------------------------------------------
@@ -207,12 +218,21 @@ if (!function_exists('swiftseek_connect')) {
             doc_type    VARCHAR(64)   NULL,
             content     MEDIUMTEXT    NOT NULL,
             char_count  INT           NOT NULL DEFAULT 0,
+            mtime       DOUBLE        NULL,
             created_at  TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
             KEY idx_doc_type (doc_type),
             KEY idx_filepath (filepath(255))
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4';
         if (!$conn->query($ddl)) {
             throw new RuntimeException('migrate_failed: ' . $conn->error);
+        }
+        // Add mtime to a pre-existing table that lacks it (idempotent).
+        $res = $conn->query("SELECT COUNT(*) AS c FROM information_schema.columns "
+            . "WHERE table_schema = DATABASE() AND table_name = 'documents' "
+            . "AND column_name = 'mtime'");
+        $row = $res ? $res->fetch_assoc() : null;
+        if ($row && (int) $row['c'] === 0) {
+            $conn->query('ALTER TABLE documents ADD COLUMN mtime DOUBLE NULL AFTER char_count');
         }
         return ['ok' => true, 'action' => 'migrate', 'detail' => 'documents table ready'];
     }
@@ -244,15 +264,21 @@ if (!function_exists('swiftseek_connect')) {
         $title = $doc['title'] ?? basename($filepath);
         $docType = $doc['doc_type'] ?? null;
         $charCount = mb_strlen($content, 'UTF-8');
+        if ($file !== null) {
+            $m = @filemtime($file);
+            $mtime = $m === false ? null : (float) $m;
+        } else {
+            $mtime = array_key_exists('mtime', $doc) ? $doc['mtime'] : null;
+        }
 
         $stmt = $conn->prepare(
-            'INSERT INTO documents (filepath, title, doc_type, content, char_count) '
-            . 'VALUES (?, ?, ?, ?, ?)'
+            'INSERT INTO documents (filepath, title, doc_type, content, char_count, mtime) '
+            . 'VALUES (?, ?, ?, ?, ?, ?)'
         );
         if ($stmt === false) {
             throw new RuntimeException('sql_prepare_failed: ' . $conn->error);
         }
-        $stmt->bind_param('ssssi', $filepath, $title, $docType, $content, $charCount);
+        $stmt->bind_param('ssssid', $filepath, $title, $docType, $content, $charCount, $mtime);
         if (!$stmt->execute()) {
             $err = $stmt->error;
             $stmt->close();
@@ -338,18 +364,23 @@ if (!function_exists('swiftseek_connect')) {
     // search  (SQL metadata filter -> PCRE grep -> capped context windows)
     // ----------------------------------------------------------------------- //
     /**
-     * Regex grep over content. $opts: ignore_case, fixed, context, max_matches,
-     * max_docs, max_line_chars, max_output_chars, plus metadata filters
-     * (doc_type, filepath, id). Returns a payload array (empty results => add a hint).
+     * Regex grep over content. Matching is CASE-INSENSITIVE by default; pass
+     * ['case_sensitive' => true] for exact case. $opts: case_sensitive, fixed,
+     * context, max_matches, max_docs, max_line_chars (default 900), max_output_chars,
+     * plus metadata filters (doc_type, filepath, id). Returns a payload array
+     * (empty results => add a hint).
      */
     function swiftseek_search(mysqli $conn, string $pattern, array $opts = []): array
     {
-        $ignoreCase = (bool) ($opts['ignore_case'] ?? false);
+        $ignoreCase = (bool) ($opts['ignore_case'] ?? true);   // case-insensitive by default
+        if (!empty($opts['case_sensitive'])) {
+            $ignoreCase = false;                               // explicit opt-out
+        }
         $fixed      = (bool) ($opts['fixed'] ?? false);
         $context    = max(0, (int) ($opts['context'] ?? 2));
         $maxMatches = (int) ($opts['max_matches'] ?? 5);
         $maxDocs    = (int) ($opts['max_docs'] ?? 20);
-        $maxLine    = (int) ($opts['max_line_chars'] ?? 300);
+        $maxLine    = (int) ($opts['max_line_chars'] ?? 900);
         $maxOutput  = (int) ($opts['max_output_chars'] ?? 40000);
 
         $rx = swiftseek__compile_regex($pattern, $ignoreCase, $fixed); // throws on bad regex
@@ -444,8 +475,9 @@ if (!function_exists('swiftseek_connect')) {
                 . 'metadata filters), or raise max_output_chars if you really need it all.';
         } elseif (!$results) {
             $payload['hint'] = 'No lexical match. Expand with synonyms / regex alternation '
-                . "(e.g. 'a|b|c'), set ignore_case, or loosen metadata filters. If still "
-                . 'empty, the question may be conceptual rather than lexical.';
+                . "(e.g. 'a|b|c') or loosen metadata filters (matching is already "
+                . 'case-insensitive). If still empty, the question may be conceptual '
+                . 'rather than lexical.';
         }
         return $payload;
     }
@@ -548,8 +580,10 @@ if (!function_exists('swiftseek_connect')) {
     }
 
     /**
-     * Recursively ingest a file or folder. $opts: doc_type, no_recursive, reindex.
-     * Skips files already stored (by absolute filepath) unless reindex is set.
+     * Recursively ingest a file or folder. $opts: doc_type, no_recursive, reindex,
+     * update. By default files already stored (by absolute filepath) are skipped.
+     * 'update' => true re-extracts a stored file only if the source is newer than the
+     * stored copy; 'reindex' => true re-extracts every stored file regardless of age.
      */
     function swiftseek_ingest(mysqli $conn, string $path, array $opts = []): array
     {
@@ -558,24 +592,40 @@ if (!function_exists('swiftseek_connect')) {
         }
         $recursive = !($opts['no_recursive'] ?? false);
         $reindex = (bool) ($opts['reindex'] ?? false);
-        $docType = $opts['doc_type'] ?? null;
+        $update = (bool) ($opts['update'] ?? false);
+        $docTypeOpt = $opts['doc_type'] ?? null;
         $exts = swiftseek__supported_exts();
 
         $added = [];
+        $updated = [];
         $skipped = [];
         $failed = [];
         foreach (swiftseek__iter_files($path, $recursive, $exts) as $file) {
             $rp = realpath($file);
             $ap = $rp !== false ? $rp : $file;
 
-            $stmt = $conn->prepare('SELECT id FROM documents WHERE filepath = ? LIMIT 1');
+            $stmt = $conn->prepare('SELECT id, mtime, doc_type FROM documents WHERE filepath = ? LIMIT 1');
             $stmt->bind_param('s', $ap);
             $stmt->execute();
-            $exists = $stmt->get_result()->fetch_assoc();
+            $existing = $stmt->get_result()->fetch_assoc();
             $stmt->close();
-            if ($exists) {
-                if (!$reindex) {
-                    $skipped[] = $ap;
+
+            $replace = false;
+            if ($existing) {
+                if ($reindex) {
+                    $replace = true;
+                } elseif ($update) {
+                    $cur = @filemtime($file);
+                    $cur = $cur === false ? null : (float) $cur;
+                    $prev = isset($existing['mtime']) ? (float) $existing['mtime'] : null;
+                    if ($cur !== null && ($prev === null || $cur > $prev)) {
+                        $replace = true;
+                    } else {
+                        $skipped[] = $ap;          // already stored and not newer
+                        continue;
+                    }
+                } else {
+                    $skipped[] = $ap;              // already stored (default: skip)
                     continue;
                 }
                 $del = $conn->prepare('DELETE FROM documents WHERE filepath = ?');
@@ -595,19 +645,31 @@ if (!function_exists('swiftseek_connect')) {
                              'error' => 'no_text_extracted (empty / image-only PDF?)'];
                 continue;
             }
+            // On replace, keep the previous doc_type unless a new one was given.
+            $docType = $docTypeOpt;
+            if ($docType === null && $existing && isset($existing['doc_type'])) {
+                $docType = $existing['doc_type'];
+            }
+            $m = @filemtime($file);
             $r = swiftseek_add($conn, [
                 'content' => $content,
                 'filepath' => $ap,
                 'title' => basename($ap),
                 'doc_type' => $docType,
+                'mtime' => $m === false ? null : (float) $m,
             ]);
-            $added[] = ['id' => $r['id'], 'filepath' => $ap, 'char_count' => $r['char_count']];
+            $rec = ['id' => $r['id'], 'filepath' => $ap, 'char_count' => $r['char_count']];
+            if ($replace) {
+                $updated[] = $rec;
+            } else {
+                $added[] = $rec;
+            }
         }
         return ['ok' => true, 'action' => 'ingest',
-                'added' => count($added), 'skipped' => count($skipped),
-                'failed' => count($failed),
-                'added_docs' => $added, 'skipped_paths' => $skipped,
-                'failed_docs' => $failed];
+                'added' => count($added), 'updated' => count($updated),
+                'skipped' => count($skipped), 'failed' => count($failed),
+                'added_docs' => $added, 'updated_docs' => $updated,
+                'skipped_paths' => $skipped, 'failed_docs' => $failed];
     }
 
     // ----------------------------------------------------------------------- //

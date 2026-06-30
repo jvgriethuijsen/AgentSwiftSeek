@@ -36,13 +36,15 @@ Every command prints JSON to stdout. Exit codes (grep convention):
     1 = no matches (a SIGNAL to refine, not a crash)
     2 = error (bad args, store missing, etc.)
 
+Search is CASE-INSENSITIVE by default; pass -s/--case-sensitive for exact case.
+
   1. SEARCH with your best literal/regex guess:
          python swiftseek-lite.py search "flood"
   2. If exit code == 1, expand the query — YOU supply the semantics the lexical
      layer lacks:
-         python swiftseek-lite.py search "flood|water damage|discharge|seepage" -i
+         python swiftseek-lite.py search "flood|water damage|discharge|seepage"
   3. Narrow with metadata when you know it (this is your WHERE clause):
-         python swiftseek-lite.py search "deductible" --doc-type policy --filepath 2024/
+         python swiftseek-lite.py search "deductible" --doc-type tag1 --filepath 2024/
   4. When a match looks relevant, READ AROUND IT:
          python swiftseek-lite.py search "burst pipe" -C 8
          python swiftseek-lite.py get 42
@@ -53,7 +55,7 @@ Every command prints JSON to stdout. Exit codes (grep convention):
 
 OUTPUT IS CAPPED so a broad first search can't blow your context window:
   * --max-docs (default 20) and --max-matches (default 5/doc) bound the COUNT.
-  * --max-line-chars (default 300) bounds the SIZE of each line. Extracted PDF/DOCX
+  * --max-line-chars (default 900) bounds the SIZE of each line. Extracted PDF/DOCX
     text often has paragraph- or document-sized "lines", so each emitted line is
     snippeted around the match; shortened lines are flagged "truncated": true.
   * --max-output-chars (default 40000 ≈ ~10k tokens) is a hard budget for the whole
@@ -71,8 +73,8 @@ SETUP
     # nothing to install. optional: point at a store location
     export SWIFTSEEK_STORE=./swiftseek.json
     python swiftseek-lite.py init
-    python swiftseek-lite.py add --file policy_001.pdf --doc-type policy
-    python swiftseek-lite.py ingest ./docs --doc-type policy   # a whole folder
+    python swiftseek-lite.py add --file policy_001.pdf --doc-type tag1
+    python swiftseek-lite.py ingest ./docs --doc-type tag1   # a whole folder
     python swiftseek-lite.py search "endorsement"
 
 The store is a single JSON file (SWIFTSEEK_STORE, default ./swiftseek.json). Writes
@@ -90,6 +92,17 @@ TEXT EXTRACTION (built in — few/zero dependencies)
 PDF extraction is best effort: scanned/image-only PDFs (no text layer) and exotic
 font encodings can come back empty or garbled. `ingest` reports empty extraction as
 a failure rather than swallowing it — treat that as a signal, not success.
+
+METADATA (optional, filter-only — not validated, no built-in meaning)
+---------------------------------------------------------------------
+Each document carries doc_type, filepath and title. They exist only to narrow a
+search (the WHERE clause):
+  * doc_type  a free-form tag YOU invent — any string at all, e.g. tag1, tag2, or a
+              real scheme like invoice / contract / nl. Filtered by EXACT match:
+              --doc-type tag1.
+  * filepath  source path, recorded automatically; filtered by SUBSTRING (--filepath).
+  * title     human label (defaults to the file's basename); shown, not filtered.
+Tag documents at add/ingest time, then scope searches to that tag. Omit to search all.
 
 COMMANDS
 --------
@@ -464,11 +477,13 @@ def cmd_add(args):
         except ExtractError as e:
             emit({"error": str(e)}, code=2)
         filepath = args.filepath or os.path.abspath(args.file)
+        mtime = _safe_mtime(args.file)
     elif args.content is not None:
         content = args.content
         if not args.filepath:
             emit({"error": "--filepath is required when using --content"}, code=2)
         filepath = args.filepath
+        mtime = None
     else:
         emit({"error": "provide either --file or --content"}, code=2)
 
@@ -482,6 +497,7 @@ def cmd_add(args):
         "doc_type": args.doc_type,
         "content": content,
         "char_count": len(content),
+        "mtime": mtime,
     })
     save(data)
     emit({"ok": True, "action": "add", "id": doc_id,
@@ -508,18 +524,39 @@ def _iter_files(root, recursive, exts):
                 yield full
 
 
+def _safe_mtime(path):
+    """Source file modification time (epoch float), or None if it can't be read."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
 def cmd_ingest(args):
     if not os.path.exists(args.path):
         emit({"error": f"no such path: {args.path!r}"}, code=2)
     data = load()
-    seen = {d["filepath"] for d in data["documents"]}
-    added, skipped, failed = [], [], []
+    by_path = {d["filepath"]: d for d in data["documents"]}
+    added, updated, skipped, failed = [], [], [], []
     for path in _iter_files(args.path, not args.no_recursive, SUPPORTED_EXTS):
         ap = os.path.abspath(path)
-        if ap in seen:
-            if not args.reindex:
-                skipped.append(ap)
+        existing = by_path.get(ap)
+        replace = False
+        if existing is not None:
+            if args.reindex:
+                replace = True
+            elif args.update:
+                cur = _safe_mtime(path)
+                prev = existing.get("mtime")
+                if cur is not None and (prev is None or cur > prev):
+                    replace = True
+                else:
+                    skipped.append(ap)         # already stored and not newer
+                    continue
+            else:
+                skipped.append(ap)             # already stored (default: skip)
                 continue
+            # drop the old record(s) for this path before re-adding
             data["documents"] = [d for d in data["documents"] if d["filepath"] != ap]
         try:
             content = extract_text(path)
@@ -530,23 +567,32 @@ def cmd_ingest(args):
             failed.append({"filepath": ap,
                            "error": "no_text_extracted (empty / image-only PDF?)"})
             continue
+        # On replace, keep the previous doc_type unless a new one was given.
+        doc_type = args.doc_type
+        if doc_type is None and existing is not None:
+            doc_type = existing.get("doc_type")
         doc_id = data.get("next_id", 1)
         data["next_id"] = doc_id + 1
-        data["documents"].append({
+        rec = {
             "id": doc_id,
             "filepath": ap,
             "title": os.path.basename(ap),
-            "doc_type": args.doc_type,
+            "doc_type": doc_type,
             "content": content,
             "char_count": len(content),
-        })
-        seen.add(ap)
-        added.append({"id": doc_id, "filepath": ap, "char_count": len(content)})
+            "mtime": _safe_mtime(path),
+        }
+        data["documents"].append(rec)
+        by_path[ap] = rec
+        (updated if replace else added).append(
+            {"id": doc_id, "filepath": ap, "char_count": len(content)})
     save(data)
     emit({"ok": True, "action": "ingest",
-          "added": len(added), "skipped": len(skipped), "failed": len(failed),
-          "added_docs": added, "skipped_paths": skipped, "failed_docs": failed},
-         code=0 if (added or skipped) else 1)
+          "added": len(added), "updated": len(updated),
+          "skipped": len(skipped), "failed": len(failed),
+          "added_docs": added, "updated_docs": updated,
+          "skipped_paths": skipped, "failed_docs": failed},
+         code=0 if (added or updated or skipped) else 1)
 
 
 # ----------------------------------------------------------------------------- #
@@ -587,7 +633,8 @@ def cmd_get(args):
 # search  (metadata filter -> regex grep -> capped context windows)
 # ----------------------------------------------------------------------------- #
 def cmd_search(args):
-    flags = re.IGNORECASE if args.ignore_case else 0
+    ignore_case = not args.case_sensitive
+    flags = re.IGNORECASE if ignore_case else 0
     pat = re.escape(args.pattern) if args.fixed else args.pattern
     try:
         rx = re.compile(pat, flags)
@@ -642,7 +689,7 @@ def cmd_search(args):
 
     payload = {
         "pattern": args.pattern,
-        "ignore_case": args.ignore_case,
+        "ignore_case": ignore_case,
         "docs_searched": len(candidates),
         "docs_matched": len(results),
         "total_matches": total_matches,
@@ -657,9 +704,9 @@ def cmd_search(args):
                            "larger --max-output-chars if you really need it all.")
     elif not results:
         payload["hint"] = ("No lexical match. Expand with synonyms / regex "
-                           "alternation (e.g. 'a|b|c'), add -i, or loosen metadata "
-                           "filters. If still empty, the question may be conceptual "
-                           "rather than lexical.")
+                           "alternation (e.g. 'a|b|c') or loosen metadata filters "
+                           "(matching is already case-insensitive). If still empty, "
+                           "the question may be conceptual rather than lexical.")
     emit(payload, code=0 if results else 1)
 
 
@@ -680,21 +727,29 @@ def build_parser():
     a.add_argument("--content", help="raw text content (alternative to --file)")
     a.add_argument("--filepath", help="original source path to record as metadata")
     a.add_argument("--title", help="document title (defaults to file basename)")
-    a.add_argument("--doc-type", dest="doc_type", help="e.g. policy, claim, manual")
+    a.add_argument("--doc-type", dest="doc_type",
+                   help="free-form tag you invent (any string, e.g. tag1); used only "
+                        "to filter searches later")
 
     ing = sub.add_parser("ingest",
                          help="recursively ingest a file or folder of documents")
     ing.add_argument("path", help="file or directory (.txt/.md/.docx/.pdf)")
     ing.add_argument("--doc-type", dest="doc_type",
-                     help="tag every ingested document with this type")
+                     help="free-form tag applied to every ingested document "
+                          "(any string, e.g. tag1)")
     ing.add_argument("--no-recursive", action="store_true",
                      help="do not descend into subdirectories")
+    ing.add_argument("--update", action="store_true",
+                     help="re-extract a stored file ONLY if the source is newer than "
+                          "the stored copy (otherwise skip); good for incremental "
+                          "re-ingests")
     ing.add_argument("--reindex", action="store_true",
-                     help="re-extract files already in the store (replace them) "
-                          "instead of skipping")
+                     help="re-extract every already-stored file (replace them all) "
+                          "regardless of age, instead of skipping")
 
     ls = sub.add_parser("list", help="list document metadata")
-    ls.add_argument("--doc-type", dest="doc_type")
+    ls.add_argument("--doc-type", dest="doc_type",
+                    help="exact-match filter on the doc_type tag (e.g. tag1)")
     ls.add_argument("--filepath", help="substring filter on filepath")
     ls.add_argument("--limit", type=int, default=100)
 
@@ -705,7 +760,10 @@ def build_parser():
 
     s = sub.add_parser("search", help="regex grep over content")
     s.add_argument("pattern", help="regex (or literal with -F)")
-    s.add_argument("-i", "--ignore-case", action="store_true", dest="ignore_case")
+    s.add_argument("-i", "--ignore-case", action="store_true", dest="ignore_case",
+                   help=argparse.SUPPRESS)  # back-compat; insensitive is the default
+    s.add_argument("-s", "--case-sensitive", action="store_true", dest="case_sensitive",
+                   help="case-sensitive matching (default: case-insensitive)")
     s.add_argument("-F", "--fixed", action="store_true",
                    help="treat pattern as a literal string, not regex")
     s.add_argument("-C", "--context", type=int, default=2,
@@ -714,15 +772,16 @@ def build_parser():
                    help="max matches reported per document (default 5)")
     s.add_argument("--max-docs", type=int, default=20,
                    help="max documents reported (default 20)")
-    s.add_argument("--max-line-chars", type=int, default=300, dest="max_line_chars",
+    s.add_argument("--max-line-chars", type=int, default=900, dest="max_line_chars",
                    help="cap per emitted line; long lines are snippeted around the "
-                        "match (default 300, 0 = unlimited)")
+                        "match (default 900, 0 = unlimited)")
     s.add_argument("--max-output-chars", type=int, default=40000,
                    dest="max_output_chars",
                    help="approx total char budget for the result; stops early and "
                         "sets truncated=true when exceeded (default 40000)")
     # metadata filters = the WHERE clause
-    s.add_argument("--doc-type", dest="doc_type")
+    s.add_argument("--doc-type", dest="doc_type",
+                   help="exact-match filter on the doc_type tag (e.g. tag1)")
     s.add_argument("--filepath", help="substring filter on filepath")
     s.add_argument("--id", dest="id_filter", type=int,
                    help="restrict to a single document id")

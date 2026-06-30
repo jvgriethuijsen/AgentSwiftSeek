@@ -4,17 +4,20 @@
 
 AgentSwiftSeek is a tiny, ultra fast search tool for your documents, built for AI agents. Instead of the usual "embed everything into a vector database" setup, it lets an agent search your documents the way a person would search a folder of files: look for a word, read around the matches, refine the search, repeat. It's deliberately small, cheap to run, and easy to understand.
 
-It comes in three flavors — same idea, same behavior, different home for your data:
+It comes in four flavors — same idea, same behavior, different home for your data:
 
 | Flavor | Folder | Use it when |
 |---|---|---|
-| **Lite** (zero dependencies) | [`swiftseek-lite/`](swiftseek-lite/) | You want a quick start, a prototype, or a small private collection. Stores everything in a single JSON file; nothing to install. |
+| **Lite** (zero dependencies) | [`swiftseek-lite/`](swiftseek-lite/) | You want a quick start, a prototype, or a small private collection. Ingests once into a single JSON file; nothing to install. |
+| **Instant** (no ingest) | [`swiftseek-instant/`](swiftseek-instant/) | You want zero setup and always-fresh results: it searches files **live on disk** on every query — no store to build or keep in sync. Best for small or frequently-changing folders. Zero dependencies. |
 | **MySQL** | [`swiftseek-mysql/`](swiftseek-mysql/) | Your documents already live in (or belong in) a database with searchable metadata. |
 | **PHP** | [`swiftseek-php/`](swiftseek-php/) | You're on PHP shared hosting (e.g. Mijndomein) and want to search against the server's native MySQL. It's an includable function library — drop it in, call its functions, no extra services. |
 
-The two Python builds (Lite and MySQL) expose an identical command-line interface, so you can start on Lite and graduate to MySQL later without changing how your agent drives it. The PHP build offers the same operations as plain PHP functions you `include`.
+Lite and MySQL share an identical command-line interface (`init`/`migrate`, `add`, `ingest`, `list`, `get`, `search`), so you can start on Lite and graduate to MySQL later without changing how your agent drives it. **Instant** uses the same `search` / `list` / `get` but skips ingestion entirely — it reads the disk live, identifying files by path instead of an id. The PHP build offers the operations as plain PHP functions you `include`.
 
-All three now read your documents directly: **`.txt`/`.md`, `.docx`, and `.pdf` text extraction is built in** — you no longer have to extract the text yourself.
+**Cached (Lite/MySQL/PHP) vs live (Instant):** the cached builds extract each document's text once at ingest time, so repeated searches are fast and nothing re-parses your PDFs; the trade-off is keeping the store in sync (`ingest --update`). Instant re-extracts whatever it scans on every search — always fresh, zero bookkeeping, but more work per query. Pick by corpus size and how often it changes.
+
+All of them read your documents directly: **`.txt`/`.md`, `.docx`, and `.pdf` text extraction is built in** — you no longer have to extract the text yourself.
 
 ---
 
@@ -90,10 +93,10 @@ If your documents are mostly structured, factual, and full of specific terms (co
 
 ```
 AgentSwiftSeek/
-├── swiftseek-lite/        # zero-dependency, single JSON file
-│   ├── swiftseek-lite.py
-│   ├── requirements.txt   # (intentionally empty — stdlib only)
-│   └── .env.example
+├── swiftseek-lite/        # zero-dependency, single JSON file — just the one script
+│   └── swiftseek-lite.py
+├── swiftseek-instant/     # zero-dependency, no store — searches the disk live
+│   └── swiftseek-instant.py
 ├── swiftseek-mysql/       # MySQL-backed, Python CLI
 │   ├── swiftseek-mysql.py
 │   ├── requirements.txt   # pymysql (pypdf optional)
@@ -116,24 +119,48 @@ Each script stays **one self-contained file**. Copy the folder you need; ignore 
 cd swiftseek-lite
 # nothing to install — Python's standard library only (Python 3.7+)
 python swiftseek-lite.py init
-python swiftseek-lite.py ingest ./docs --doc-type policy   # a whole folder of pdf/docx/txt
+python swiftseek-lite.py ingest ./docs --doc-type tag1   # a whole folder of pdf/docx/txt
 python swiftseek-lite.py search "flood"
 ```
+
+### Instant — no ingest, search the disk live
+
+```bash
+cd swiftseek-instant
+# nothing to install — Python's standard library only (Python 3.7+)
+export SWIFTSEEK_DIR=./docs                 # bash/macOS/Linux  (or pass --dir to each command)
+python swiftseek-instant.py search "flood"  # walks ./docs live, extracts + greps
+python swiftseek-instant.py list            # the files it would search
+python swiftseek-instant.py get ./docs/policy_001.pdf   # results identify files by PATH
+```
+
+```powershell
+# Windows PowerShell — same thing, PowerShell sets env vars differently:
+cd swiftseek-instant
+$env:SWIFTSEEK_DIR = "./docs"                # or pass --dir to each command
+python swiftseek-instant.py search "flood"
+```
+
+No `init`, no `ingest` — there's no store. Each search re-reads the files on disk, so results are always current. Narrow with `--filepath <substring>` and `--ext pdf,docx`.
 
 ### MySQL — the database version
 
 ```bash
 cd swiftseek-mysql
 pip install -r requirements.txt            # just pymysql (pypdf optional)
-cp .env.example .env && edit .env          # set SWIFTSEEK_HOST/USER/PASSWORD/DB
+cp .env.example .env                       # then edit .env: SWIFTSEEK_HOST/USER/PASSWORD/DB
 python swiftseek-mysql.py migrate          # create the table once
-python swiftseek-mysql.py ingest ./docs --doc-type policy
+python swiftseek-mysql.py ingest ./docs --doc-type tag1
 python swiftseek-mysql.py search "flood"
 ```
 
-Both Python scripts carry full instructions for an AI agent right at the top of the file — how to search, refine, and read results — so you can point your agent at the script and it will know how to use it. Exit codes follow the `grep` convention: `0` = matches, `1` = no matches (a signal to refine), `2` = error.
+> Commands above are shown for bash/macOS/Linux. They work as-is in **Windows PowerShell** too — `cp` is an alias for `Copy-Item` — with one exception: PowerShell sets environment variables as `$env:NAME = "value"` (not `export NAME=value`), and chains commands with `;` rather than `&&`. Credentials here come from the `.env` file, so no `export` is needed either way.
 
-The shared commands are: `init`/`migrate`, `add`, `ingest`, `list`, `get`, `search`.
+Each Python script carries full instructions for an AI agent right at the top of the file — how to search, refine, and read results — so you can point your agent at the script and it will know how to use it. Exit codes follow the `grep` convention: `0` = matches, `1` = no matches (a signal to refine), `2` = error.
+
+Commands: Lite and MySQL share `init`/`migrate`, `add`, `ingest`, `list`, `get`, `search`; Instant has `search`, `list`, `get` (no ingest — it reads the disk live).
+
+Search is **case-insensitive by default** — add `-s`/`--case-sensitive` (Python) or `['case_sensitive' => true]` (PHP) when you need exact case (e.g. to tell a code like `IT` apart from the word `it`). Each match is returned with a snippet of up to ~900 characters around it (`--max-line-chars`), bounded by a total response budget (`--max-output-chars`).
 
 ### PHP — the shared-hosting library
 
@@ -149,9 +176,9 @@ $db = swiftseek_connect();                  // native mysqli, auto-loads ./confi
 // $db = swiftseek_connect(['host'=>'localhost','user'=>'app','password'=>'secret','database'=>'docs']);
 
 swiftseek_migrate($db);                                         // create the table once
-swiftseek_ingest($db, __DIR__ . '/docs', ['doc_type' => 'policy']);
+swiftseek_ingest($db, __DIR__ . '/docs', ['doc_type' => 'tag1']);
 
-$hits = swiftseek_search($db, 'flood|water damage|discharge', ['ignore_case' => true]);
+$hits = swiftseek_search($db, 'flood|water damage|discharge');   // case-insensitive by default
 header('Content-Type: application/json');
 echo json_encode($hits, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
 ```
@@ -166,7 +193,7 @@ The functions return ordinary PHP arrays (`json_encode` them to get the same sha
 
 ## Documents & formats
 
-Hand `add --file` and `ingest` (or `swiftseek_add`/`swiftseek_ingest` in PHP) your real files — extraction is built in, with as few dependencies as possible:
+Hand `add --file` and `ingest` (or `swiftseek_add`/`swiftseek_ingest` in PHP) your real files — extraction is built in, with as few dependencies as possible. (Instant uses the very same extraction, just live on each search instead of at ingest.)
 
 | Format | How it's read | Dependency |
 |---|---|---|
@@ -174,15 +201,36 @@ Hand `add --file` and `ingest` (or `swiftseek_add`/`swiftseek_ingest` in PHP) yo
 | `.docx` | unzipped and parsed as XML | **none** (Python stdlib `zipfile`/`xml`; PHP `zip` extension) |
 | `.pdf` | content streams inflated and text operators parsed | **none required** (Python stdlib `zlib`; PHP `zlib` extension) |
 
-- **`ingest <folder>`** walks a file or directory (recursively by default), extracts each supported file, and stores it. It's **idempotent**: files already stored (matched by absolute path) are skipped, unless you pass `--reindex` (Python) / `['reindex' => true]` (PHP) to re-extract and replace them.
+- **`ingest <folder>`** walks a file or directory (recursively by default), extracts each supported file, and stores it. It's **idempotent**: files already stored (matched by absolute path) are **skipped** by default. Pass `--update` (Python) / `['update' => true]` (PHP) to re-extract only files whose source is **newer** than the stored copy (incremental sync — it records each file's modification time), or `--reindex` / `['reindex' => true]` to re-extract **all** stored files regardless of age. A re-ingest keeps the existing `doc_type` unless you give a new one. The result counts `added` / `updated` / `skipped` / `failed`.
 - **PDF extraction is best effort.** The built-in extractor handles common text PDFs well, but **scanned/image-only PDFs (no text layer) and exotic font encodings can come back empty or garbled.** `ingest` reports empty extraction as a *failure* rather than silently storing nothing — treat that as a signal. For tricky PDFs in the Python builds, installing **`pypdf`** (optional) upgrades extraction automatically; it is never required.
 - **Legacy `.doc`** (old binary Word) is not supported — convert to `.docx` or `.txt` first.
 
 ---
 
+## Metadata & filtering
+
+Every document carries three optional pieces of metadata. They are **just labels** — they have no built-in meaning and aren't validated — and their only job is to let an agent **narrow the search before grepping the text** (the equivalent of a SQL `WHERE`):
+
+| Field | What it is | How it's used |
+|---|---|---|
+| **`doc_type`** | A free-form tag *you* invent — any string at all (`tag1`, `tag2`, … or a real scheme like `invoice` / `contract` / `nl`). Optional; defaults to none. | **Exact-match** filter. `--doc-type tag1` matches only documents tagged exactly `tag1` (case-sensitive). |
+| **`filepath`** | The source path, recorded automatically on `add`/`ingest`. | **Substring** filter. `--filepath 2024/` matches any path containing `2024/`. |
+| **`title`** | A human label; defaults to the file's basename. | Shown in results; not a search filter. |
+
+So `--doc-type` is **simply a tag** — `tag1` here is just a placeholder; pick whatever names suit your collection. Tag documents at ingest time, then scope a search to that group:
+
+```bash
+python swiftseek-lite.py ingest ./docs --doc-type tag1
+python swiftseek-lite.py search "deductible" --doc-type tag1   # only the 'tag1' docs
+```
+
+In PHP it's the same idea: `swiftseek_ingest($db, $dir, ['doc_type' => 'tag1'])` then `swiftseek_search($db, 'deductible', ['doc_type' => 'tag1'])`. Omit `doc_type` entirely and every document is searched.
+
+---
+
 ## Configuration & secrets
 
-- **Python:** a `.env` file is auto-loaded at startup — first found of `$SWIFTSEEK_ENV`, `./.env`, or a `.env` next to the script. Real environment variables always win over the file. Copy `.env.example` to `.env` to begin. (Lite needs only `SWIFTSEEK_STORE`; MySQL needs `SWIFTSEEK_HOST/PORT/USER/PASSWORD/DB`.)
+- **Python:** a `.env` file, *if present*, is auto-loaded at startup — first found of `$SWIFTSEEK_ENV`, `./.env`, or a `.env` next to the script; real environment variables always win over it. **Lite** needs no config to run and ships no `.env.example` (its store defaults to `./swiftseek.json`; set `SWIFTSEEK_STORE` to move it). **Instant** also runs with no config (search dir defaults to `.`; set `SWIFTSEEK_DIR` or pass `--dir`). **MySQL** needs `SWIFTSEEK_HOST/PORT/USER/PASSWORD/DB` — copy its `.env.example` to `.env` to begin.
 - **PHP:** copy `config.example.php` to `config.php` and fill it in — `swiftseek_connect()` auto-loads it. (Or pass credentials straight to `swiftseek_connect([...])`.) See the `config.php` note in the PHP quick start above for why this is safer than `.env`.
 - **Never commit real secrets.** The repo `.gitignore` already excludes the Python `.env` files and the PHP `config.php` (keeping the `.example` templates) plus the Lite JSON store. Run the database under a user scoped to just the `documents` table — these tools only `SELECT`/`INSERT`.
 
@@ -195,8 +243,11 @@ Early and intentionally small. The goal is to stay lean and easy to read — if 
 Contributions, ideas, and "this worked / didn't work for my documents" reports are all welcome.
 
 ## Author
-Joey van Griethuijsen, freelance AI & Software Solutions Architect
+Joey van Griethuijsen, 
+freelance AI & Software Solutions Architect
+
 📧 Contact: [info@joeyvg.nl]
+
 🌐 Website: [https://joeyvg.nl/en]
 
 ## License
